@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QDateEdit, QTextEdit, QTableWidget, QTableWidgetItem,
     QAbstractItemView, QHeaderView, QMessageBox, QMenu, QStatusBar, QFrame, QLineEdit,
-    QStackedWidget, QCheckBox
+    QStackedWidget, QCheckBox, QInputDialog
 )
 
 # Excel
@@ -304,6 +304,70 @@ def read_activity_rows_for_ticket(path: Path, ticket_id: str) -> List[Tuple[str,
     return [(ticket_id, r[1], r[2]) for r in rows]
 
 
+# -------- New helpers for updating Ticket IDs --------
+
+def update_ticket_id_in_incidents_by_row(path: Path, excel_row_idx: int, new_ticket_id: str):
+    wb = ensure_workbook_and_sheet(path)
+    ws = wb[SHEET_NAME]
+    ws.cell(row=excel_row_idx, column=2, value=new_ticket_id)  # column 2 = Ticket ID
+    try:
+        wb.save(path)
+    except PermissionError:
+        raise PermissionError(
+            f"Cannot save the Excel file.\n\nFile may be open or folder not writable:\n{path}\n\n"
+            "Close the file if open, or move the EXE and Excel to a writable folder (e.g., Desktop/Documents)."
+        )
+
+
+def rename_ticket_id_in_activity(path: Path, old_id: str, new_id: str) -> int:
+    wb = ensure_workbook_and_sheet(path)
+    ws = wb[ACTIVITY_SHEET_NAME]
+    changed = 0
+    for r in range(2, ws.max_row + 1):
+        a = ws.cell(row=r, column=1).value
+        if str(a or "").strip() == old_id:
+            ws.cell(row=r, column=1, value=new_id)
+            changed += 1
+    try:
+        wb.save(path)
+    except PermissionError:
+        raise PermissionError(
+            f"Cannot save the Excel file.\n\nFile may be open or folder not writable:\n{path}\n\n"
+            "Close the file if open, or move the EXE and Excel to a writable folder (e.g., Desktop/Documents)."
+        )
+    return changed
+
+
+def any_activity_for_ticket(path: Path, ticket_id: str) -> bool:
+    if not path.exists():
+        return False
+    wb = load_workbook(path, data_only=True)
+    if ACTIVITY_SHEET_NAME not in wb.sheetnames:
+        return False
+    ws = wb[ACTIVITY_SHEET_NAME]
+    for r in range(2, ws.max_row + 1):
+        a = ws.cell(row=r, column=1).value
+        if str(a or "").strip() == ticket_id:
+            return True
+    return False
+
+
+def ticket_id_exists_elsewhere(path: Path, new_id: str, exclude_row: int) -> bool:
+    if not path.exists():
+        return False
+    wb = load_workbook(path, data_only=True)
+    if SHEET_NAME not in wb.sheetnames:
+        return False
+    ws = wb[SHEET_NAME]
+    for r in range(2, ws.max_row + 1):
+        if r == exclude_row:
+            continue
+        val = ws.cell(row=r, column=2).value
+        if str(val or "").strip() == new_id:
+            return True
+    return False
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -419,6 +483,12 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self.btn_add = QPushButton("Add")
         self.btn_add.clicked.connect(self.on_add)
+
+        # New: Update Ticket ID button
+        self.btn_update = QPushButton("Update Ticket ID")
+        self.btn_update.setToolTip("Update the selected row's Ticket ID (and optionally Activity)")
+        self.btn_update.clicked.connect(self.on_update_ticket_id)
+
         self.btn_clear = QPushButton("Clear")
         self.btn_clear.clicked.connect(self.on_clear)
         self.btn_open = QPushButton("Open Excel")
@@ -448,7 +518,7 @@ class MainWindow(QMainWindow):
         self.lbl_latest_icon = QLabel()
         self.lbl_latest_icon.setToolTip("Latest First")
         self.lbl_latest_icon.setCursor(Qt.PointingHandCursor)
-        # Clicking the icon toggles the checkbox
+
         def _toggle_checkbox(_event):
             self.chk_latest_first.toggle()
         self.lbl_latest_icon.mousePressEvent = _toggle_checkbox  # type: ignore
@@ -461,6 +531,7 @@ class MainWindow(QMainWindow):
         tip.setStyleSheet("color:#8A5555;")
 
         btn_row.addWidget(self.btn_add)
+        btn_row.addWidget(self.btn_update)
         btn_row.addWidget(self.btn_clear)
         btn_row.addWidget(self.btn_open)
         btn_row.addWidget(self.btn_refresh)
@@ -485,7 +556,6 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.on_table_context_menu)
-        # Do NOT mirror selection into input fields
         self.table.itemDoubleClicked.connect(self.on_table_double_clicked)
         root.addWidget(self.table)
 
@@ -575,6 +645,14 @@ class MainWindow(QMainWindow):
         colour = QColor(46, 125, 50) if checked else QColor(122, 122, 122)
         self.lbl_latest_icon.setPixmap(sort_az_pixmap(20, fg=colour))
 
+    def _select_row_by_excel_row(self, excel_row_idx: int):
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item and item.data(Qt.UserRole) == excel_row_idx:
+                self.table.selectRow(r)
+                self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                break
+
     # -------- Main view handlers --------
 
     def set_today(self):
@@ -652,7 +730,26 @@ class MainWindow(QMainWindow):
     def load_table(self):
         try:
             ensure_workbook_and_sheet(EXCEL_PATH)
-            rows = read_rows(EXCEL_PATH)
+            wb = load_workbook(EXCEL_PATH, data_only=True)
+            if SHEET_NAME not in wb.sheetnames:
+                rows = []
+            else:
+                ws = wb[SHEET_NAME]
+                rows = []
+                for excel_row in range(2, ws.max_row + 1):
+                    created_on = ws.cell(row=excel_row, column=1).value
+                    ticket_id = ws.cell(row=excel_row, column=2).value
+                    description = ws.cell(row=excel_row, column=3).value
+                    # Skip completely empty rows
+                    if created_on is None and ticket_id is None and description is None:
+                        continue
+                    if isinstance(created_on, (datetime, date)):
+                        dstr = created_on.strftime("%Y-%m-%d")
+                    elif created_on:
+                        dstr = str(created_on)
+                    else:
+                        dstr = ""
+                    rows.append((excel_row, dstr, str(ticket_id or ""), description or ""))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to read Excel:\n{e}")
             return
@@ -660,12 +757,19 @@ class MainWindow(QMainWindow):
         # Disable sorting while populating to avoid reordering during insertions
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
-        for dstr, ticket, desc in rows:
+        for excel_row, dstr, ticket, desc in rows:
             r = self.table.rowCount()
             self.table.insertRow(r)
-            self.table.setItem(r, 0, QTableWidgetItem(dstr))
-            self.table.setItem(r, 1, QTableWidgetItem(ticket))
-            self.table.setItem(r, 2, QTableWidgetItem(desc))
+            it0 = QTableWidgetItem(dstr)
+            it1 = QTableWidgetItem(ticket)
+            it2 = QTableWidgetItem(desc)
+            # Store the Excel row index on the items (UserRole)
+            it0.setData(Qt.UserRole, excel_row)
+            it1.setData(Qt.UserRole, excel_row)
+            it2.setData(Qt.UserRole, excel_row)
+            self.table.setItem(r, 0, it0)
+            self.table.setItem(r, 1, it1)
+            self.table.setItem(r, 2, it2)
 
         # Re-apply sorting if user wants latest first
         if self.latest_first:
@@ -684,8 +788,12 @@ class MainWindow(QMainWindow):
         act_copy.triggered.connect(self.copy_selected_row)
         act_open = QAction("View Activity", self)
         act_open.triggered.connect(self.open_activity_for_selection)
+        act_update = QAction("Update Ticket ID...", self)
+        act_update.triggered.connect(self.on_update_ticket_id)
         menu.addAction(act_copy)
         menu.addAction(act_open)
+        menu.addSeparator()
+        menu.addAction(act_update)
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def copy_selected_row(self):
@@ -713,6 +821,105 @@ class MainWindow(QMainWindow):
             return
         ticket_id = item.text().strip()
         self.open_activity_view_for_ticket(ticket_id)
+
+    # -------- Update Ticket ID handler --------
+
+    def on_update_ticket_id(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "No selection", "Please select a row to update.")
+            return
+
+        item_ticket = self.table.item(row, 1)
+        item_any = self.table.item(row, 0)
+        if not item_ticket or not item_any:
+            QMessageBox.information(self, "Invalid selection", "Selected row is invalid.")
+            return
+
+        old_ticket = item_ticket.text().strip()
+        excel_row_idx = item_any.data(Qt.UserRole)
+        if not isinstance(excel_row_idx, int):
+            QMessageBox.critical(self, "Error", "Internal reference to Excel row not found.")
+            return
+
+        # Default proposed value: current Ticket Edit if non-empty, otherwise the old ticket
+        default_text = self.ticket_edit.text().strip() or old_ticket
+
+        new_ticket, ok = QInputDialog.getText(
+            self, "Update Ticket ID",
+            f"Enter new Ticket ID for the selected row:\nOld: {old_ticket}",
+            text=default_text
+        )
+        if not ok:
+            return
+        new_ticket = new_ticket.strip()
+        if not new_ticket:
+            QMessageBox.information(self, "No change", "New Ticket ID cannot be empty.")
+            return
+        if new_ticket == old_ticket:
+            self.update_status("Ticket ID unchanged.")
+            return
+
+        # Optional duplicate check
+        try:
+            if ticket_id_exists_elsewhere(EXCEL_PATH, new_ticket, exclude_row=excel_row_idx):
+                resp = QMessageBox.question(
+                    self, "Duplicate Ticket ID",
+                    f"The Ticket ID '{new_ticket}' already exists in the list.\n"
+                    "Do you still want to proceed?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if resp != QMessageBox.Yes:
+                    return
+        except Exception:
+            pass  # non-fatal; allow update
+
+        # Update INCIDENTS
+        try:
+            update_ticket_id_in_incidents_by_row(EXCEL_PATH, excel_row_idx, new_ticket)
+        except PermissionError as e:
+            QMessageBox.critical(self, "Cannot save", str(e))
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to update Ticket ID:\n{e}")
+            return
+
+        # Optionally update Activity sheet if there are records for old_ticket
+        changed = 0
+        try:
+            if any_activity_for_ticket(EXCEL_PATH, old_ticket):
+                resp = QMessageBox.question(
+                    self, "Also update Activity?",
+                    f"Activity entries exist for '{old_ticket}'.\n"
+                    f"Do you want to rename them to '{new_ticket}' as well?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+                )
+                if resp == QMessageBox.Yes:
+                    changed = rename_ticket_id_in_activity(EXCEL_PATH, old_ticket, new_ticket)
+                    self.update_status(f"Ticket ID updated; Activity entries renamed: {changed}")
+                else:
+                    self.update_status("Ticket ID updated (Activity not changed).")
+            else:
+                self.update_status("Ticket ID updated.")
+        except PermissionError as e:
+            QMessageBox.critical(self, "Cannot save", str(e))
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to update Activity:\n{e}")
+            return
+
+        # Refresh and reselect the updated row
+        self.load_table()
+        self._select_row_by_excel_row(excel_row_idx)
+
+        # If Activity view is open for the old ticket and we renamed, update the view
+        if changed > 0 and self._activity_ticket_id == old_ticket:
+            self._activity_ticket_id = new_ticket
+            self.act_title.setText(f"Activity: {new_ticket}")
+            self.load_activity_table()
+
+        # Update the input field to reflect new ticket
+        self.ticket_edit.setText(new_ticket)
 
     # -------- Activity view handlers --------
 
