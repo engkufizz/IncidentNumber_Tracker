@@ -5,13 +5,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import List, Tuple
 
-from PySide6.QtCore import Qt, QDate, QPoint
-from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap, QColor, QKeySequence
+from PySide6.QtCore import Qt, QDate, QPoint, QSize, QPointF, QRectF
+from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap, QColor, QKeySequence, QFont, QPen
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QDateEdit, QTextEdit, QTableWidget, QTableWidgetItem,
     QAbstractItemView, QHeaderView, QMessageBox, QMenu, QStatusBar, QFrame, QLineEdit,
-    QStackedWidget
+    QStackedWidget, QCheckBox
 )
 
 # Excel
@@ -179,6 +179,41 @@ def emoji_icon(emoji: str, size: int = 128,
     return QIcon(pm)
 
 
+def sort_az_pixmap(size: int = 20, fg=QColor(45, 20, 20)) -> QPixmap:
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+
+    pen = QPen(fg)
+    pen.setWidth(max(1, int(size * 0.08)))
+    p.setPen(pen)
+
+    # Down arrow on the left
+    m = size * 0.18
+    x = m + size * 0.08
+    y_top = m
+    y_bot = size - m - size * 0.1
+    p.drawLine(QPointF(x, y_top), QPointF(x, y_bot))
+    ah = size * 0.22
+    p.drawLine(QPointF(x, y_bot), QPointF(x - ah, y_bot - ah))
+    p.drawLine(QPointF(x, y_bot), QPointF(x + ah, y_bot - ah))
+
+    # A and Z on the right
+    f = QFont()
+    f.setBold(True)
+    f.setPointSizeF(size * 0.52)
+    p.setFont(f)
+
+    right_x = size * 0.46
+    half_h = size * 0.48
+    p.drawText(QRectF(right_x, 0, size - right_x, half_h), Qt.AlignLeft | Qt.AlignVCenter, "A")
+    p.drawText(QRectF(right_x, half_h - size * 0.06, size - right_x, half_h), Qt.AlignLeft | Qt.AlignVCenter, "Z")
+
+    p.end()
+    return pm
+
+
 # -------- Activity helpers --------
 
 def append_activity_start(path: Path, ticket_id: str, start_dt: datetime):
@@ -270,6 +305,7 @@ class MainWindow(QMainWindow):
 
         self._user_edited_ticket = False  # track if user has typed in Ticket ID
         self._activity_ticket_id: str = ""  # current ticket shown in Activity view
+        self.latest_first: bool = False  # user-controlled sort state
 
         # Central with stacked views
         central = QWidget()
@@ -379,6 +415,34 @@ class MainWindow(QMainWindow):
         self.btn_open.clicked.connect(self.open_excel)
         self.btn_refresh = QPushButton("Refresh List")
         self.btn_refresh.clicked.connect(self.load_table)
+
+        # Strongly-visible checkbox + clickable A↓Z icon label
+        self.chk_latest_first = QCheckBox()
+        self.chk_latest_first.setTristate(False)
+        self.chk_latest_first.setToolTip("Latest First")
+        self.chk_latest_first.setStyleSheet("""
+        QCheckBox::indicator {
+          width: 20px; height: 20px;
+          border: 2px solid #8A5555;
+          border-radius: 4px;
+          background: #FFFFFF;
+        }
+        QCheckBox::indicator:hover { border-color: #C62828; }
+        QCheckBox::indicator:checked {
+          background: #2E7D32;   /* strong green background when ON */
+          border-color: #2E7D32;
+        }
+        """)
+        self.chk_latest_first.toggled.connect(self.on_toggle_latest_first)
+
+        self.lbl_latest_icon = QLabel()
+        self.lbl_latest_icon.setToolTip("Latest First")
+        self.lbl_latest_icon.setCursor(Qt.PointingHandCursor)
+        # Clicking the icon toggles the checkbox
+        def _toggle_checkbox(_event):
+            self.chk_latest_first.toggle()
+        self.lbl_latest_icon.mousePressEvent = _toggle_checkbox  # type: ignore
+
         self.btn_view_activity = QPushButton("View Activity")
         self.btn_view_activity.setToolTip("Open Activity view for the selected Ticket ID")
         self.btn_view_activity.clicked.connect(self.open_activity_for_selection)
@@ -390,6 +454,11 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_clear)
         btn_row.addWidget(self.btn_open)
         btn_row.addWidget(self.btn_refresh)
+
+        # Add checkbox and its icon label
+        btn_row.addWidget(self.chk_latest_first)
+        btn_row.addWidget(self.lbl_latest_icon)
+
         btn_row.addWidget(self.btn_view_activity)
         btn_row.addStretch(1)
         btn_row.addWidget(tip)
@@ -408,10 +477,10 @@ class MainWindow(QMainWindow):
         self.table.customContextMenuRequested.connect(self.on_table_context_menu)
         # Do NOT mirror selection into input fields
         self.table.itemDoubleClicked.connect(self.on_table_double_clicked)
-        # Enable user sorting and show sort indicator
-        self.table.setSortingEnabled(True)
-        self.table.horizontalHeader().setSortIndicatorShown(True)
         root.addWidget(self.table)
+
+        # Set initial icon tint based on current state
+        self._update_latest_icon(self.chk_latest_first.isChecked())
 
     def _build_activity_page(self, page: QWidget):
         root = QVBoxLayout(page)
@@ -458,9 +527,6 @@ class MainWindow(QMainWindow):
         self.act_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.act_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.act_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        # Enable user sorting and show sort indicator
-        self.act_table.setSortingEnabled(True)
-        self.act_table.horizontalHeader().setSortIndicatorShown(True)
         root.addWidget(self.act_table)
 
         tip = QLabel("Tip: Use Ctrl+Shift+S to Start and Ctrl+E to Stop while on this view.")
@@ -491,6 +557,13 @@ class MainWindow(QMainWindow):
         # Activity view shortcuts
         add_seq("Ctrl+Shift+S", self.on_start_activity)
         add_seq("Ctrl+E", self.on_stop_activity)
+
+    # -------- Helpers --------
+
+    def _update_latest_icon(self, checked: bool):
+        # Green when ON, grey when OFF
+        colour = QColor(46, 125, 50) if checked else QColor(122, 122, 122)
+        self.lbl_latest_icon.setPixmap(sort_az_pixmap(20, fg=colour))
 
     # -------- Main view handlers --------
 
@@ -553,6 +626,19 @@ class MainWindow(QMainWindow):
         combined = normalize_description(text)
         self.preview.setText(combined or "(nothing yet)")
 
+    def on_toggle_latest_first(self, checked: bool):
+        # Update icon tint
+        self._update_latest_icon(checked)
+        # Sorting behaviour
+        self.latest_first = checked
+        if checked:
+            self.table.setSortingEnabled(True)
+            self.table.sortByColumn(0, Qt.DescendingOrder)  # Created On column
+        else:
+            # Disable sorting and reload to restore the original order from the file
+            self.table.setSortingEnabled(False)
+            self.load_table()
+
     def load_table(self):
         try:
             ensure_workbook_and_sheet(EXCEL_PATH)
@@ -561,7 +647,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to read Excel:\n{e}")
             return
 
-        # Disable sorting while filling to prevent churn
+        # Disable sorting while populating to avoid reordering during insertions
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         for dstr, ticket, desc in rows:
@@ -571,10 +657,10 @@ class MainWindow(QMainWindow):
             self.table.setItem(r, 1, QTableWidgetItem(ticket))
             self.table.setItem(r, 2, QTableWidgetItem(desc))
 
-        # Re-enable sorting and force "latest first" by Created On (column 0)
-        self.table.setSortingEnabled(True)
-        self.table.sortItems(0, Qt.DescendingOrder)
-        self.table.horizontalHeader().setSortIndicator(0, Qt.DescendingOrder)
+        # Re-apply sorting if user wants latest first
+        if self.latest_first:
+            self.table.setSortingEnabled(True)
+            self.table.sortByColumn(0, Qt.DescendingOrder)
 
         self.update_status(f"File: {EXCEL_PATH} • records: {len(rows)}")
 
@@ -657,8 +743,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to read Activity:\n{e}")
             return
 
-        # Disable sorting while filling
-        self.act_table.setSortingEnabled(False)
         self.act_table.setRowCount(0)
         for t, start_str, end_str in rows:
             r = self.act_table.rowCount()
@@ -666,11 +750,6 @@ class MainWindow(QMainWindow):
             self.act_table.setItem(r, 0, QTableWidgetItem(t))
             self.act_table.setItem(r, 1, QTableWidgetItem(start_str))
             self.act_table.setItem(r, 2, QTableWidgetItem(end_str))
-
-        # Re-enable sorting and force latest Start Time first (column 1)
-        self.act_table.setSortingEnabled(True)
-        self.act_table.sortItems(1, Qt.DescendingOrder)
-        self.act_table.horizontalHeader().setSortIndicator(1, Qt.DescendingOrder)
 
         # Show open/closed status
         try:
