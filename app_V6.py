@@ -1059,7 +1059,7 @@ def main():
     # Windows: set AppUserModelID for proper taskbar icon/grouping
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("IncidentTracker.Maxis.1.1")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Incident.Tracker.1.1")
         except Exception:
             pass
 
