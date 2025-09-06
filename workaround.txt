@@ -1,0 +1,200 @@
+Title: OneDrive conflict workaround and scheduled backup (generic)
+
+Summary
+- Keep the live Excel file local to avoid OneDrive sync conflicts.
+- Automatically copy the local master file to OneDrive on a schedule.
+- Works for any user account; no hard-coded usernames or drive letters.
+- Defaults to backing up IncidentTracker’s incident_numbers.xlsx, but you can point it at any source file and destination.
+
+What this backs up by default
+- Source (local master): %LOCALAPPDATA%\IncidentTracker\incident_numbers.xlsx
+  Example: C:\Users\<you>\AppData\Local\IncidentTracker\incident_numbers.xlsx
+- Destination (if OneDrive is detected and no override provided): <OneDrive>\Backups\incident_numbers_bak.xlsx
+
+You can override the destination path or folder via parameters.
+
+1) Create a scripts folder
+- Example: D:\Scripts (or any folder you prefer)
+
+2) Save this PowerShell script
+- File name: D:\Scripts\Sync-FileToOneDrive.ps1
+- Contents:
+
+powershell
+param(
+    [switch]$Install,
+    [switch]$Uninstall,
+    [int]$EveryMinutes = 10,
+
+    # The file you want to copy (defaults to IncidentTracker’s workbook in LOCALAPPDATA)
+    [string]$Source = $(Join-Path $env:LOCALAPPDATA 'IncidentTracker\incident_numbers.xlsx'),
+
+    # Provide either a full destination file path (-Dest), or a destination folder (-DestDir).
+    # If neither is provided, the script tries to detect OneDrive and uses <OneDrive>\Backups\<base>_bak<ext>
+    [string]$Dest = '',
+    [string]$DestDir = '',
+
+    # Name of the scheduled task
+    [string]$TaskName = 'Sync IncidentTracker to OneDrive'
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Resolve-Dest([string]$src, [string]$dest, [string]$destDir) {
+    # If user provided a full destination file path, use it
+    if ($dest) { return $dest }
+
+    # Compute default backup file name based on source: baseName_bak.ext
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($src)
+    $ext      = [System.IO.Path]::GetExtension($src)
+    $fileName = "${baseName}_bak$ext"
+
+    # If user provided a destination folder, combine it
+    if ($destDir) { return (Join-Path $destDir $fileName) }
+
+    # Otherwise, try to detect OneDrive
+    $odCandidates = @($env:OneDrive, $env:OneDriveCommercial, $env:OneDriveConsumer) | Where-Object { $_ -and (Test-Path $_) }
+    $od = $odCandidates | Select-Object -First 1
+    if ($od) {
+        return (Join-Path (Join-Path $od 'Backups') $fileName)
+    }
+
+    throw "Destination not provided and OneDrive not detected. Provide -Dest 'C:\path\file.xlsx' or -DestDir 'C:\path\folder'."
+}
+
+# Use a consistent PowerShell exe path for the scheduled task
+$PwshExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+function Copy-Atomic([string]$src, [string]$dst) {
+    if (-not (Test-Path -LiteralPath $src)) {
+        Write-Host "Source not found: $src"
+        return
+    }
+
+    $destDir = Split-Path -Path $dst -Parent
+    New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+
+    # Wait briefly if the app appears to be writing (looks for a '.lock' companion file)
+    $srcLock = "$src.lock"
+    $waited = 0
+    while ((Test-Path -LiteralPath $srcLock) -and ($waited -lt 15)) {
+        Start-Sleep -Seconds 1
+        $waited++
+    }
+
+    # Copy to temp in destination folder, then rename in-place (atomic on the same volume)
+    $tmp = "$dst.tmp.$PID"
+    $maxTries = 5
+    $ok = $false
+    for ($i=1; $i -le $maxTries -and -not $ok; $i++) {
+        try {
+            Copy-Item -LiteralPath $src -Destination $tmp -Force
+            Move-Item -LiteralPath $tmp -Destination $dst -Force
+            $ok = $true
+        } catch {
+            if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+            Start-Sleep -Seconds 2
+        }
+    }
+
+    if ($ok) {
+        Write-Host "Synced: $src -> $dst"
+    } else {
+        Write-Warning "Failed to sync after $maxTries attempts: $src"
+    }
+}
+
+function Task-Exists([string]$name) {
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & schtasks.exe /Query /TN "$name" > $null 2>&1
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $old
+    return ($code -eq 0)
+}
+
+function Install-Task([string]$name, [string]$src, [string]$dst, [int]$every) {
+    # Remove existing task quietly
+    if (Task-Exists -name $name) {
+        & schtasks.exe /Delete /TN "$name" /F > $null 2>&1
+    }
+
+    # Build the task action with correct quoting and pass resolved parameters
+    $quotedExe    = $PwshExe.Replace('"','""')
+    $quotedScript = $MyInvocation.MyCommand.Path.Replace('"','""')
+    $qSrc         = $src.Replace('"','""')
+    $qDst         = $dst.Replace('"','""')
+
+    $tr = "`"$quotedExe`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$quotedScript`" -Source `"$qSrc`" -Dest `"$qDst`""
+
+    & schtasks.exe /Create /TN "$name" /SC MINUTE /MO $every /TR "$tr" /F > $null 2>&1
+
+    Write-Host "Task installed: $name (every $every minute(s))"
+    & schtasks.exe /Run /TN "$name" > $null 2>&1
+}
+
+function Uninstall-Task([string]$name) {
+    if (Task-Exists -name $name) {
+        & schtasks.exe /Delete /TN "$name" /F > $null 2>&1
+        Write-Host "Task removed: $name"
+    } else {
+        Write-Host "Task not found: $name"
+    }
+}
+
+# Resolve destination now (so we can pass a concrete path to the task)
+$ResolvedDest = Resolve-Dest -src $Source -dest $Dest -destDir $DestDir
+
+if ($Install) {
+    Install-Task -name $TaskName -src $Source -dst $ResolvedDest -every $EveryMinutes
+    exit 0
+}
+if ($Uninstall) {
+    Uninstall-Task -name $TaskName
+    exit 0
+}
+
+# Default action: perform one copy now
+Copy-Atomic -src $Source -dst $ResolvedDest
+
+3) How to use
+
+- Install the scheduled task (every 15 minutes), using defaults:
+  powershell -ExecutionPolicy Bypass -File "D:\Scripts\Sync-FileToOneDrive.ps1" -Install -EveryMinutes 15
+  This will:
+  - Use source: %LOCALAPPDATA%\IncidentTracker\incident_numbers.xlsx
+  - Detect OneDrive and set destination: <OneDrive>\Backups\incident_numbers_bak.xlsx
+  - Create a task named “Sync IncidentTracker to OneDrive”
+
+- Install with an explicit destination folder (script will name the file <base>_bak<ext>):
+  powershell -ExecutionPolicy Bypass -File "D:\Scripts\Sync-FileToOneDrive.ps1" -Install -EveryMinutes 15 -DestDir "D:\OneDrive - YourOrg\Projects\INC_Tracker\output"
+
+- Install with an explicit destination file path:
+  powershell -ExecutionPolicy Bypass -File "D:\Scripts\Sync-FileToOneDrive.ps1" -Install -EveryMinutes 15 -Dest "D:\OneDrive - YourOrg\Projects\INC_Tracker\output\incident_numbers_bak.xlsx"
+
+- Install for a different source file (e.g., NetworkChangesTracker):
+  powershell -ExecutionPolicy Bypass -File "D:\Scripts\Sync-FileToOneDrive.ps1" -Install -EveryMinutes 15 -Source "$env:LOCALAPPDATA\NetworkChangesTracker\network_changes.xlsx"
+
+- Run a one-off copy now (no schedule):
+  powershell -ExecutionPolicy Bypass -File "D:\Scripts\Sync-FileToOneDrive.ps1"
+
+- Uninstall the task:
+  powershell -ExecutionPolicy Bypass -File "D:\Scripts\Sync-FileToOneDrive.ps1" -Uninstall
+
+4) Verify and troubleshoot
+
+- Check the task:
+  schtasks /Query /TN "Sync IncidentTracker to OneDrive" /V /FO LIST
+  Last Result should be 0 after a successful run.
+
+- Confirm the destination file timestamp:
+  dir "<your destination path>\incident_numbers_bak.xlsx"
+
+- If OneDrive isn’t detected and you didn’t supply -Dest or -DestDir, the script will prompt with an error. Re-run with -Dest or -DestDir.
+
+- If the app is saving at that moment, the script waits up to ~15 seconds for its “.lock” file to disappear, then copies using a temp-then-rename to avoid partial files.
+
+Notes
+- Destination folder inside OneDrive should be set to “Always keep on this device” for reliable, fast writes.
+- The scheduled task runs under the current user by default. If you want “run whether user is logged on or not”, edit the task in Task Scheduler and provide credentials.
+- You can create multiple tasks by changing -TaskName and -Source/-Dest for different files.
