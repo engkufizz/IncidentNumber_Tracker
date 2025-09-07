@@ -1,8 +1,3 @@
-Great — I see your new version adds an **Activity sheet** with Start/Stop tracking, a **stacked main/activity view**, extra shortcuts, and refined UI logic.
-Here’s the **updated README.md** to match this codebase:
-
----
-
 # 🚨 Incident Number Tracker
 
 A desktop tool built with **PySide6** and **openpyxl** to help teams log and manage **incident tickets** and their **activity timelines**.
