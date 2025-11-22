@@ -1,7 +1,6 @@
 import os
 import sys
 import shutil
-import time
 import ctypes
 from datetime import date, datetime
 from pathlib import Path
@@ -45,6 +44,8 @@ def is_frozen() -> bool:
     return getattr(sys, "frozen", False)
 
 
+# -------- Helper to find the script/exe directory (for icons) --------
+
 def app_dir() -> Path:
     if is_frozen():
         return Path(sys.executable).resolve().parent
@@ -54,7 +55,7 @@ def app_dir() -> Path:
         return Path.cwd()
 
 
-# -------- Local data directory (keep live file out of OneDrive) --------
+# -------- Local data directory (Restored to AppData) --------
 
 def get_data_dir() -> Path:
     if sys.platform == "win32":
@@ -106,79 +107,21 @@ def find_onedrive_dir() -> Path:
     return home
 
 
-# -------- Robust save helpers (atomic save + simple lock + Excel lock detect) --------
+# -------- Simple Save Helper (Reverted from Complex Locking) --------
 
-def excel_lock_exists(path: Path) -> bool:
-    # Excel creates a lock file like "~$incident_numbers.xlsx" while open
-    lock = path.with_name(f"~${path.name}")
-    return lock.exists()
-
-
-def acquire_file_lock(path: Path, timeout: float = 10.0) -> Optional[Tuple[Path, int]]:
+def save_workbook_simple(wb, path: Path):
     """
-    Try to acquire a simple lock using a .lock file next to 'path'.
-    Returns (lock_path, fd) if acquired, or None on timeout.
+    Simple save method. Replaces the complex 'atomic save' that caused
+    PermissionErrors on Windows.
     """
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-            # Keep the fd open to hold the lock
-            os.write(fd, f"pid={os.getpid()} time={time.time()}".encode("utf-8"))
-            return lock_path, fd
-        except FileExistsError:
-            time.sleep(0.2)
-        except Exception:
-            time.sleep(0.2)
-    return None
-
-
-def release_file_lock(lock: Optional[Tuple[Path, int]]):
-    if not lock:
-        return
-    lock_path, fd = lock
     try:
-        try:
-            os.close(fd)
-        except Exception:
-            pass
-        if lock_path.exists():
-            try:
-                lock_path.unlink()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-def safe_save_workbook(wb, path: Path):
-    """
-    Atomic save: write to a tmp file in the same directory then replace.
-    """
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    # Ensure parent exists
-    path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(tmp)
-    os.replace(tmp, path)
-
-
-def save_wb_with_lock(wb, path: Path):
-    if excel_lock_exists(path):
+        wb.save(path)
+    except PermissionError:
         raise PermissionError(
-            f"Cannot save the Excel file because it is open in Excel.\n\n"
-            f"Please close the workbook first:\n{path}"
+            f"Cannot save the Excel file.\n\n"
+            f"The file is currently open in Excel or locked by another process:\n{path}\n\n"
+            "Please close the Excel file and try again."
         )
-    lock = acquire_file_lock(path, timeout=10.0)
-    if not lock:
-        raise PermissionError(
-            f"File appears busy. Try again in a moment.\n\n{path}\n\n"
-            "If the file is in OneDrive, ensure it is 'Always keep on this device' and not actively syncing."
-        )
-    try:
-        safe_save_workbook(wb, path)
-    finally:
-        release_file_lock(lock)
 
 
 def ensure_workbook_and_sheet(path: Path):
@@ -189,7 +132,12 @@ def ensure_workbook_and_sheet(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     dirty = False
     if path.exists():
-        wb = load_workbook(path)
+        try:
+            wb = load_workbook(path)
+        except Exception:
+            # If load fails (corrupt or very locked), try creating new or fail hard
+            wb = Workbook()
+            dirty = True
     else:
         wb = Workbook()
         dirty = True
@@ -228,7 +176,7 @@ def ensure_workbook_and_sheet(path: Path):
             dirty = True
 
     if dirty:
-        save_wb_with_lock(wb, path)
+        save_workbook_simple(wb, path)
     return wb
 
 
@@ -247,19 +195,17 @@ def append_row(path: Path, d: date, ticket_id: str, desc: str):
     ws.append([d, ticket_id, desc])
     last_row = ws.max_row
     ws.cell(row=last_row, column=1).number_format = DATE_NUMBER_FORMAT
-    try:
-        save_wb_with_lock(wb, path)
-    except PermissionError:
-        raise PermissionError(
-            f"Cannot save the Excel file.\n\nFile may be open or folder not writable:\n{path}\n\n"
-            "Close the file if open, or move the app and Excel to a writable folder (e.g., Desktop/Documents)."
-        )
+    save_workbook_simple(wb, path)
 
 
 def read_rows(path: Path) -> List[Tuple[str, str, str]]:
     if not path.exists():
         return []
-    wb = load_workbook(path, data_only=True)
+    try:
+        wb = load_workbook(path, data_only=True)
+    except Exception:
+        return []
+        
     if SHEET_NAME not in wb.sheetnames:
         return []
     ws = wb[SHEET_NAME]
@@ -370,13 +316,7 @@ def append_activity_start(path: Path, ticket_id: str, start_dt: datetime):
     ws.append([ticket_id, start_dt, None])
     last_row = ws.max_row
     ws.cell(row=last_row, column=2).number_format = DATETIME_NUMBER_FORMAT
-    try:
-        save_wb_with_lock(wb, path)
-    except PermissionError:
-        raise PermissionError(
-            f"Cannot save the Excel file.\n\nFile may be open or folder not writable:\n{path}\n\n"
-            "Close the file if open, or move the EXE and Excel to a writable folder (e.g., Desktop/Documents)."
-        )
+    save_workbook_simple(wb, path)
 
 
 def find_latest_open_activity_row(ws, ticket_id: str) -> int:
@@ -399,13 +339,7 @@ def set_activity_end(path: Path, ticket_id: str, end_dt: datetime) -> bool:
         return False
     ws.cell(row=row_idx, column=3, value=end_dt)
     ws.cell(row=row_idx, column=3).number_format = DATETIME_NUMBER_FORMAT
-    try:
-        save_wb_with_lock(wb, path)
-    except PermissionError:
-        raise PermissionError(
-            f"Cannot save the Excel file.\n\nFile may be open or folder not writable:\n{path}\n\n"
-            "Close the file if open, or move the EXE and Excel to a writable folder (e.g., Desktop/Documents)."
-        )
+    save_workbook_simple(wb, path)
     return True
 
 
@@ -448,13 +382,7 @@ def update_ticket_id_in_incidents_by_row(path: Path, excel_row_idx: int, new_tic
     wb = ensure_workbook_and_sheet(path)
     ws = wb[SHEET_NAME]
     ws.cell(row=excel_row_idx, column=2, value=new_ticket_id)  # column 2 = Ticket ID
-    try:
-        save_wb_with_lock(wb, path)
-    except PermissionError:
-        raise PermissionError(
-            f"Cannot save the Excel file.\n\nFile may be open or folder not writable:\n{path}\n\n"
-            "Close the file if open, or move the EXE and Excel to a writable folder (e.g., Desktop/Documents)."
-        )
+    save_workbook_simple(wb, path)
 
 
 def rename_ticket_id_in_activity(path: Path, old_id: str, new_id: str) -> int:
@@ -466,13 +394,7 @@ def rename_ticket_id_in_activity(path: Path, old_id: str, new_id: str) -> int:
         if str(a or "").strip() == old_id:
             ws.cell(row=r, column=1, value=new_id)
             changed += 1
-    try:
-        save_wb_with_lock(wb, path)
-    except PermissionError:
-        raise PermissionError(
-            f"Cannot save the Excel file.\n\nFile may be open or folder not writable:\n{path}\n\n"
-            "Close the file if open, or move the EXE and Excel to a writable folder (e.g., Desktop/Documents)."
-        )
+    save_workbook_simple(wb, path)
     return changed
 
 
